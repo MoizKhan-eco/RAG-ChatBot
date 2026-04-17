@@ -1,0 +1,13 @@
+gradio
+langchain-core
+langchain-community
+langchain-google-genai
+langchain-chroma
+langchain-classic
+chromadb
+pypdf
+rank-bm25
+python-dotenv
+google-generativeai
+langfuse
+langchain-openai
