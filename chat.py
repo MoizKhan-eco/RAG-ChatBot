@@ -41,7 +41,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # Initialize LLM via Organization's OpenAI-compatible API
 model = ChatOpenAI(
-    model=os.getenv("API_CHAT_MODEL", "baseten/zai-org/glm-5"),
+    model=os.getenv("API_CHAT_MODEL"),
     base_url=os.getenv("API_BASE_URL"),
     api_key=os.getenv("API_KEY"),
     temperature=0.1
@@ -65,7 +65,7 @@ all_splits = text_splitter.split_documents(docs)
 
 # Embeddings via Organization's OpenAI-compatible API
 embeddings = OpenAIEmbeddings(
-    model=os.getenv("API_EMBEDDING_MODEL", "text-embedding-3-small"),
+    model=os.getenv("API_EMBEDDING_MODEL"),
     base_url=os.getenv("API_BASE_URL"),
     api_key=os.getenv("API_KEY"),
 )

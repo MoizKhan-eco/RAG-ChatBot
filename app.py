@@ -14,19 +14,22 @@ ROOT = Path(__file__).parent
 # load external CSS
 CSS = (ROOT / "UI.css").read_text(encoding="utf-8")
 
-# --- Speech-to-text with Gemini (Optional) ---
-# Note: STT requires a separate Google API key. If not available, voice input is disabled.
-STT_AVAILABLE = False
+
+# --- Speech-to-text with Gemini ---
 try:
-    google_api_key = os.getenv("GOOGLE_API_KEY")
-    if google_api_key and google_api_key.strip():
-        genai.configure(api_key=google_api_key)
+    # Configure Gemini API
+    genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+
+    # Test if API key is valid
+    if os.getenv("GOOGLE_API_KEY"):
         STT_AVAILABLE = True
         print("✅ Gemini Speech-to-Text initialized successfully")
     else:
-        print("ℹ️ Speech-to-Text disabled (no GOOGLE_API_KEY) - text chat works fine")
+        STT_AVAILABLE = False
+        print("⚠️ Gemini API key not configured - Speech-to-Text disabled")
 except Exception as e:
-    print(f"ℹ️ Speech-to-Text disabled: {e}")
+    STT_AVAILABLE = False
+    print(f"⚠️ Gemini Speech-to-Text initialization failed: {e}")
 
 def transcribe_with_gemini(audio_path):
     """
@@ -34,31 +37,32 @@ def transcribe_with_gemini(audio_path):
     """
     if not STT_AVAILABLE:
         return None
-    
+
     try:
         # Read the audio file
         with open(audio_path, 'rb') as audio_file:
             audio_data = audio_file.read()
-        
+
         # Create a multimodal model instance
+        genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
         model = genai.GenerativeModel(os.getenv("GOOGLE_MODEL_NAME"))
-        
+
         # Create audio part for Gemini
         audio_part = {
             "mime_type": "audio/wav",  # Gradio typically records as WAV
             "data": audio_data
         }
-        
+
         # Request transcription
         prompt = "Please transcribe this audio accurately. Return only the transcribed text without any additional commentary."
-        
+
         response = model.generate_content([prompt, audio_part])
-        
+
         if response and response.text:
             return response.text.strip()
         else:
             return None
-            
+
     except Exception as e:
         print(f"Gemini transcription error: {e}")
         return None

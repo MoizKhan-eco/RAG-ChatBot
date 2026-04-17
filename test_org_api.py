@@ -161,7 +161,8 @@ def test_api_connection():
     print("\n📋 Checking available models...")
     models = client.list_models()
     if models:
-        print(f"✅ Available models: {', '.join(models[:5])}{'...' if len(models) > 5 else ''}")
+        for m in models:
+            print(f"Name: {m}\n")
     else:
         print("⚠️  Could not list models (this is okay, endpoint may not be supported)")
     
