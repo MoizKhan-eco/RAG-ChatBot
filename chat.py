@@ -1,5 +1,8 @@
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 import os
+import json
+import hashlib
+import pickle
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -11,6 +14,7 @@ from langchain_chroma import Chroma
 
 from langchain_core.prompts import MessagesPlaceholder
 from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.documents import Document
 
 from langchain_community.document_loaders import DirectoryLoader, PyPDFLoader
 from langchain_community.retrievers import BM25Retriever
@@ -50,18 +54,15 @@ model = ChatOpenAI(
 ROOT = Path(__file__).parent
 DOCS_DIR = ROOT / "docs"
 DOCS_DIR.mkdir(exist_ok=True)  # ensure ./docs exists
-
-loader = DirectoryLoader(
-    str(DOCS_DIR),
-    glob="**/*.pdf",            # search all subfolders
-    loader_cls=PyPDFLoader,
-    show_progress=True
-)
-docs = loader.load()
-
-# split as before
-text_splitter = RecursiveCharacterTextSplitter(chunk_size=300, chunk_overlap=50)
-all_splits = text_splitter.split_documents(docs)
+VECTOR_DB_DIR = ROOT / ".chroma"
+VECTOR_DB_DIR.mkdir(exist_ok=True)
+RETRIEVER_CACHE_DIR = ROOT / ".retriever_cache"
+RETRIEVER_CACHE_DIR.mkdir(exist_ok=True)
+VECTOR_DB_STATE_PATH = VECTOR_DB_DIR / "index_state.json"
+VECTOR_COLLECTION_NAME = "digipal_docs"
+SPLITS_CACHE_PATH = RETRIEVER_CACHE_DIR / "document_splits.json"
+BM25_CACHE_PATH = RETRIEVER_CACHE_DIR / "bm25_retriever.pkl"
+RETRIEVER_STATE_PATH = RETRIEVER_CACHE_DIR / "state.json"
 
 # Embeddings via Organization's OpenAI-compatible API
 embeddings = OpenAIEmbeddings(
@@ -69,13 +70,158 @@ embeddings = OpenAIEmbeddings(
     base_url=os.getenv("API_BASE_URL"),
     api_key=os.getenv("API_KEY"),
 )
+
+
+def build_docs_fingerprint():
+    pdf_paths = sorted(DOCS_DIR.glob("**/*.pdf"))
+    fingerprint_data = [
+        {
+            "path": str(path.relative_to(ROOT)).replace("\\", "/"),
+            "size": path.stat().st_size,
+            "mtime_ns": path.stat().st_mtime_ns,
+        }
+        for path in pdf_paths
+    ]
+    payload = json.dumps(fingerprint_data, sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest(), pdf_paths
+
+
+def load_state(path):
+    if not path.exists():
+        return {}
+
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_state(path, state):
+    path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+
+def load_and_split_documents():
+    loader = DirectoryLoader(
+        str(DOCS_DIR),
+        glob="**/*.pdf",
+        loader_cls=PyPDFLoader,
+        show_progress=True,
+    )
+    docs = loader.load()
+
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=300, chunk_overlap=50)
+    return text_splitter.split_documents(docs)
+
+
+def serialize_documents(documents):
+    return [
+        {
+            "page_content": doc.page_content,
+            "metadata": doc.metadata,
+        }
+        for doc in documents
+    ]
+
+
+def deserialize_documents(payload):
+    return [
+        Document(page_content=item["page_content"], metadata=item.get("metadata", {}))
+        for item in payload
+    ]
+
+
+def get_document_splits():
+    fingerprint, pdf_paths = build_docs_fingerprint()
+    state = load_state(RETRIEVER_STATE_PATH)
+    cache_is_fresh = (
+        state.get("docs_fingerprint") == fingerprint
+        and SPLITS_CACHE_PATH.exists()
+    )
+
+    if cache_is_fresh:
+        print("Using cached document chunks from disk.")
+        payload = json.loads(SPLITS_CACHE_PATH.read_text(encoding="utf-8"))
+        all_splits = deserialize_documents(payload)
+        return all_splits, fingerprint, pdf_paths
+
+    print("Documents changed. Loading and splitting PDFs...")
+    all_splits = load_and_split_documents()
+    SPLITS_CACHE_PATH.write_text(
+        json.dumps(serialize_documents(all_splits), ensure_ascii=True, indent=2),
+        encoding="utf-8",
+    )
+    save_state(
+        RETRIEVER_STATE_PATH,
+        {
+            "docs_fingerprint": fingerprint,
+            "pdf_count": len(pdf_paths),
+            "chunk_count": len(all_splits),
+        },
+    )
+    return all_splits, fingerprint, pdf_paths
+
+
+def get_or_create_vector_store(all_splits, fingerprint, pdf_paths):
+    state = load_state(VECTOR_DB_STATE_PATH)
+    needs_reindex = state.get("docs_fingerprint") != fingerprint
+
+    vector_store = Chroma(
+        collection_name=VECTOR_COLLECTION_NAME,
+        persist_directory=str(VECTOR_DB_DIR),
+        embedding_function=embeddings,
+    )
+
+    if needs_reindex:
+        print("Document set changed. Rebuilding vector index...")
+        vector_store.reset_collection()
+        vector_store.add_documents(documents=all_splits)
+        save_state(
+            VECTOR_DB_STATE_PATH,
+            {
+                "docs_fingerprint": fingerprint,
+                "pdf_count": len(pdf_paths),
+                "chunk_count": len(all_splits),
+            }
+        )
+        return vector_store
+
+    print("Using existing vector index from disk.")
+    return vector_store
+
+
+def get_or_create_bm25_retriever(all_splits, fingerprint):
+    state = load_state(RETRIEVER_STATE_PATH)
+    cache_is_fresh = (
+        state.get("docs_fingerprint") == fingerprint
+        and BM25_CACHE_PATH.exists()
+    )
+
+    if cache_is_fresh:
+        try:
+            with open(BM25_CACHE_PATH, "rb") as cache_file:
+                bm25_retriever = pickle.load(cache_file)
+            print("Using cached BM25 retriever from disk.")
+            bm25_retriever.k = 5
+            return bm25_retriever
+        except Exception as e:
+            print(f"BM25 cache load failed, rebuilding retriever: {e}")
+
+    print("Building BM25 retriever from document chunks...")
+    bm25_retriever = BM25Retriever.from_documents(all_splits)
+    bm25_retriever.k = 5
+
+    with open(BM25_CACHE_PATH, "wb") as cache_file:
+        pickle.dump(bm25_retriever, cache_file)
+
+    return bm25_retriever
+
+
 ### Vector Search and bm25 : Hybrid Retreiver
-vector_store = Chroma(embedding_function=embeddings)
-_ = vector_store.add_documents(documents=all_splits)
+all_splits, docs_fingerprint, pdf_paths = get_document_splits()
+vector_store = get_or_create_vector_store(all_splits, docs_fingerprint, pdf_paths)
 
 vector_retriever = vector_store.as_retriever(type = "similarity", search_kwargs = {"k" : 5})
-bm25_retriever = BM25Retriever.from_documents(all_splits)
-bm25_retriever.k = 5
+bm25_retriever = get_or_create_bm25_retriever(all_splits, docs_fingerprint)
 ensemble_retriever = EnsembleRetriever(retrievers=[bm25_retriever, vector_retriever],weights=[0.4, 0.6])
 
 
